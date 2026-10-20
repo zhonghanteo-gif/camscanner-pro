@@ -1663,6 +1663,20 @@ async def serve_dashboard():
     return HTMLResponse(content=HTML_CONTENT)
 
 
+@app.get("/api/diagnostics")
+@app.get("/health")
+async def health_diagnostics():
+    """Health check endpoint for Render, Uptime monitors, and Keep-Awake workflows."""
+    return {
+        "status": "healthy",
+        "app": "CamScanner Pro",
+        "version": "2.0.0",
+        "ocr_available": HAS_OCR,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)

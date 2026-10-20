@@ -1,0 +1,78 @@
+name: Render 24/7 Keep-Awake Ping
+
+on:
+  schedule:
+    # Runs every 10 minutes to prevent Render free instance from hibernating
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping CamScanner Pro Diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping Diagnostics Endpoint with Retry
+        run: |
+          python3 - << 'EOF'
+          import urllib.request
+          import urllib.error
+          import json
+          import time
+          import sys
+          import os
+
+          # If secret/env var RENDER_APP_URL is provided, use it; otherwise fallback
+          TARGET_URL = os.environ.get("RENDER_APP_URL", "https://camscanner-pro.onrender.com/api/diagnostics")
+          MAX_RETRIES = 5
+          INITIAL_WAIT = 5
+
+          print(f"Target: {TARGET_URL}")
+          print(f"Starting keep-awake ping cycle (max retries: {MAX_RETRIES})...")
+
+          for attempt in range(1, MAX_RETRIES + 1):
+              start_time = time.time()
+              print(f"\n--- Attempt {attempt}/{MAX_RETRIES} ---")
+              try:
+                  req = urllib.request.Request(
+                      TARGET_URL,
+                      headers={
+                          "User-Agent": "GitHub-Actions-Keep-Awake/1.0",
+                          "Accept": "application/json"
+                      },
+                      method="GET"
+                  )
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      latency = time.time() - start_time
+                      status = resp.status
+                      body = resp.read().decode("utf-8")
+                      print(f"Status Code : {status}")
+                      print(f"Latency     : {latency:.2f}s")
+                      print(f"Response    : {body}")
+
+                      if status == 200:
+                          print("SUCCESS: Render instance is awake and healthy!")
+                          sys.exit(0)
+                      else:
+                          print(f"Non-200 status code: {status}")
+
+              except urllib.error.HTTPError as e:
+                  latency = time.time() - start_time
+                  print(f"HTTP Error  : {e.code} ({e.reason}) after {latency:.2f}s")
+              except Exception as e:
+                  latency = time.time() - start_time
+                  print(f"Exception   : {e} after {latency:.2f}s")
+
+              if attempt < MAX_RETRIES:
+                  wait_time = INITIAL_WAIT * attempt
+                  print(f"Instance may be warming up. Retrying in {wait_time}s...")
+                  time.sleep(wait_time)
+
+          print("\nNotice: Wakeup cycle completed.")
+          sys.exit(0)
+          EOF
