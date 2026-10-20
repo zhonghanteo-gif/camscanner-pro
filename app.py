@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from pydantic import BaseModel
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -553,16 +553,28 @@ async def delete_document(doc_id: str):
 
 
 @app.post("/api/documents/{doc_id}/pages")
-async def add_page_to_document(doc_id: str, page_id: str = Form(...)):
+async def add_page_to_document(doc_id: str, request: Request):
     """Appends an already processed page to a document."""
+    pid = None
+    ct = request.headers.get("content-type", "")
+    if "application/json" in ct:
+        data = await request.json()
+        pid = data.get("page_id")
+    else:
+        form = await request.form()
+        pid = form.get("page_id")
+
+    if not pid:
+        raise HTTPException(status_code=422, detail="Missing page_id")
+
     db = load_db()
     for d in db.get("documents", []):
         if d["id"] == doc_id:
-            page_file = f"{page_id}.jpg"
-            thumb_file = f"{page_id}_thumb.jpg"
+            page_file = f"{pid}.jpg"
+            thumb_file = f"{pid}_thumb.jpg"
             d.setdefault("pages", []).append(
                 {
-                    "id": page_id,
+                    "id": pid,
                     "url": f"/files/pages/{page_file}",
                     "thumbnail_url": f"/files/thumbnails/{thumb_file}",
                 }
