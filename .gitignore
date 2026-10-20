@@ -36,6 +36,9 @@ storage/pdfs/*
 !storage/pdfs/.gitkeep
 storage/data.json
 
+# Binaries
+*.exe
+
 # IDEs & OS
 .idea/
 .vscode/

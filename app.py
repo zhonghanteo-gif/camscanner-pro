@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -652,6 +652,9 @@ HTML_CONTENT = """<!DOCTYPE html>
   <meta name="theme-color" content="#189a80">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/icon.svg">
   <title>CamScanner Pro</title>
 
   <!-- Tailwind CSS -->
@@ -739,6 +742,10 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
       <div class="flex items-center space-x-1">
+        <button id="pwa-install-btn" onclick="installPWA()" class="hidden px-2.5 py-1 text-xs bg-brand hover:bg-brand-dark text-white font-medium rounded-full shadow flex items-center gap-1 transition mr-1">
+          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+          <span>Install</span>
+        </button>
         <button id="btn-search-toggle" class="p-2 text-slate-300 hover:text-white rounded-full hover:bg-slate-800 transition">
           <i data-lucide="search" class="w-5 h-5"></i>
         </button>
@@ -1647,6 +1654,31 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     document.getElementById('btn-refresh').onclick = fetchDocuments;
 
+    let deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      const pwaBtn = document.getElementById('pwa-install-btn');
+      if (pwaBtn) pwaBtn.classList.remove('hidden');
+    });
+
+    function installPWA() {
+      if (deferredPrompt) {
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then((choiceResult) => {
+          if (choiceResult.outcome === 'accepted') {
+            const pwaBtn = document.getElementById('pwa-install-btn');
+            if (pwaBtn) pwaBtn.classList.add('hidden');
+          }
+          deferredPrompt = null;
+        });
+      }
+    }
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+
     window.onload = () => {
       lucide.createIcons();
       fetchDocuments();
@@ -1661,6 +1693,91 @@ HTML_CONTENT = """<!DOCTYPE html>
 async def serve_dashboard():
     """Serves the complete CamScanner Pro responsive Mobile & Web SPA."""
     return HTMLResponse(content=HTML_CONTENT)
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(
+        content={
+            "name": "CamScanner Pro",
+            "short_name": "CamScanner",
+            "description": "Smart Document Scanner, Perspective Correction & OCR Engine",
+            "start_url": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#020617",
+            "theme_color": "#189a80",
+            "icons": [
+                {
+                    "src": "/icon.svg",
+                    "sizes": "192x192 512x512",
+                    "type": "image/svg+xml",
+                    "purpose": "any maskable"
+                }
+            ]
+        }
+    )
+
+
+@app.get("/icon.svg")
+async def icon_svg():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#189a80"/>
+      <stop offset="100%" stop-color="#0b5b4c"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#grad)"/>
+  <g filter="url(#shadow)" fill="none" stroke="#ffffff" stroke-width="28" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 180 L160 120 L352 120 L392 180 Z" fill="#ffffff" fill-opacity="0.15"/>
+    <rect x="96" y="180" width="320" height="230" rx="36"/>
+    <circle cx="256" cy="295" r="68" stroke-width="26" fill="#ffffff" fill-opacity="0.2"/>
+    <circle cx="360" cy="225" r="14" fill="#ffffff" stroke="none"/>
+  </g>
+  <path d="M180 295 L230 345 L335 240" fill="none" stroke="#22c55e" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.get("/sw.js")
+async def service_worker():
+    sw_code = """
+const CACHE_NAME = 'camscanner-v2';
+const ASSETS = [
+  '/',
+  '/manifest.json',
+  '/icon.svg',
+  'https://cdn.tailwindcss.com',
+  'https://unpkg.com/lucide@latest'
+];
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)).catch(() => {})
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    caches.match(e.request).then((res) => {
+      return res || fetch(e.request).then((netRes) => {
+        return netRes;
+      }).catch(() => caches.match('/'));
+    })
+  );
+});
+"""
+    return Response(content=sw_code, media_type="application/javascript")
 
 
 @app.get("/api/diagnostics")
