@@ -180,46 +180,58 @@ def apply_camscanner_filter(
     img = image_bgr.copy()
 
     if filter_type == "magic":
-        # CamScanner Signature "Magic Color"
-        # 1. Convert to LAB color space
+        # CamScanner Signature "Magic Color" via Retinex Division Normalization
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        # 2. Histogram percentile analysis on luminance channel
-        hist = cv2.calcHist([l], [0], None, [256], [0, 256]).flatten()
-        total_pixels = l.size
-        cum = np.cumsum(hist)
+        # 1. Background Illumination Estimation via large morphological dilation & Gaussian blur
+        h, w = l.shape[:2]
+        k_size = max(17, (min(h, w) // 35) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+        dilated = cv2.dilate(l, kernel)
+        bg_illum = cv2.medianBlur(dilated, k_size)
+        bg_illum = cv2.GaussianBlur(bg_illum, (k_size, k_size), 0)
 
-        p5_idx = np.searchsorted(cum, 0.05 * total_pixels)
-        p92_idx = np.searchsorted(cum, 0.92 * total_pixels)
+        # 2. Division Normalization: I_norm = min(255, (I / I_bg) * 255)
+        # Erases shadows and overhead lighting gradients across the paper
+        norm_l = np.clip((l.astype(np.float32) / np.maximum(bg_illum.astype(np.float32), 1.0)) * 255.0, 0, 255).astype(np.uint8)
 
-        black_pt = max(15, p5_idx)
-        white_pt = min(245, max(170, p92_idx))
-        val_range = max(30, white_pt - black_pt)
+        # 3. Dynamic range expansion: whiten near-whites, deepen dark text strokes
+        norm_l[norm_l > 220] = 255
+        norm_l[norm_l < 50] = (norm_l[norm_l < 50] * 0.8).astype(np.uint8)
 
-        # 3. Dynamic range stretching & background whitening
-        l_float = l.astype(np.float32)
-        norm_l = np.clip(((l_float - black_pt) / val_range) * 255.0, 0, 255)
+        # 4. Unsharp masking kernel for razor-sharp text legibility
+        gaussian = cv2.GaussianBlur(norm_l, (0, 0), 2.2)
+        l_sharp = cv2.addWeighted(norm_l, 1.45, gaussian, -0.45, 0)
 
-        # Smooth curve to force grey/shadowed paper to pure white
-        white_mask = norm_l > 185
-        norm_l[white_mask] = 185 + (255 - 185) * np.clip(((norm_l[white_mask] - 185) / 70.0) * 1.35, 0, 1)
-
-        # Deepen text strokes
-        dark_mask = norm_l < 70
-        norm_l[dark_mask] = norm_l[dark_mask] * 0.85
-
-        # 4. Gentle unsharp masking for crisp text
-        l_enhanced = norm_l.astype(np.uint8)
-        gaussian = cv2.GaussianBlur(l_enhanced, (0, 0), 2.5)
-        l_sharp = cv2.addWeighted(l_enhanced, 1.35, gaussian, -0.35, 0)
-
-        # 5. Saturate color channels slightly so stamps/ink pop
-        a_boost = cv2.multiply(a, 1.06)
-        b_boost = cv2.multiply(b, 1.06)
+        # 5. Chromaticity restoration so official red stamps and blue pen ink pop
+        a_boost = cv2.addWeighted(a, 1.25, np.full_like(a, 128), -0.25, 0)
+        b_boost = cv2.addWeighted(b, 1.25, np.full_like(b, 128), -0.25, 0)
 
         merged = cv2.merge([l_sharp, a_boost, b_boost])
         res = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    elif filter_type == "dewarp" or filter_type == "curved_book":
+        # Cylindrical dewarping for curved pages / book spines
+        h, w = img.shape[:2]
+        map_x = np.tile(np.arange(w, dtype=np.float32), (h, 1))
+        map_y = np.tile(np.arange(h, dtype=np.float32)[:, np.newaxis], (1, w))
+
+        # Sine-based vertical baseline arc correction
+        amp = max(10.0, h * 0.035)
+        offset = amp * np.sin(np.pi * (map_x / w))
+        map_y_shifted = np.clip(map_y - offset + (amp * 0.5), 0, h - 1).astype(np.float32)
+
+        dewarped = cv2.remap(img, map_x, map_y_shifted, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+        return apply_camscanner_filter(dewarped, "magic", brightness, contrast)
+
+    elif filter_type == "clean_print":
+        # High-contrast printed template filter (attenuates stray ballpoint/pencil artifacts)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+        bw = cv2.adaptiveThreshold(opened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 12)
+        res = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
     elif filter_type == "bw":
         # Clean B&W Document (Adaptive Gaussian binarization)
@@ -442,15 +454,36 @@ async def ocr_page(page_id: str):
         }
 
     try:
-        result, _ = ocr_engine(str(page_path))
-        if not result:
-            return {"success": True, "text": "", "lines": []}
+        out = ocr_engine(str(page_path))
+        lines = []
+        boxes = []
+        scores = []
 
-        lines = [r[1] for r in result]
+        if hasattr(out, "txts") and out.txts:
+            lines = list(out.txts)
+            if hasattr(out, "boxes") and out.boxes is not None:
+                boxes = [b.tolist() if hasattr(b, "tolist") else b for b in out.boxes]
+            if hasattr(out, "scores") and out.scores is not None:
+                scores = [float(s) for s in out.scores]
+        elif isinstance(out, tuple) and out[0]:
+            lines = [r[1] for r in out[0]]
+            boxes = [r[0] for r in out[0]]
+            scores = [float(r[2]) for r in out[0]]
+        elif isinstance(out, list):
+            lines = [r[1] for r in out]
+            boxes = [r[0] for r in out]
+            scores = [float(r[2]) for r in out]
+
         full_text = "\n".join(lines)
-        return {"success": True, "text": full_text, "lines": lines}
+        return {
+            "success": True,
+            "text": full_text,
+            "lines": lines,
+            "boxes": boxes,
+            "scores": scores,
+        }
     except Exception as e:
-        return {"success": False, "error": str(e), "text": "", "lines": []}
+        return {"success": False, "error": str(e), "text": "", "lines": [], "boxes": []}
 
 
 @app.get("/api/documents")
@@ -603,9 +636,87 @@ async def delete_page_from_document(doc_id: str, page_id: str):
     raise HTTPException(status_code=404, detail="Document not found.")
 
 
+def create_dual_layer_searchable_pdf(page_paths: List[Path], out_pdf_path: Path):
+    """
+    Creates a Dual-Layer Searchable PDF:
+    - Visible Layer: High-contrast raster document image
+    - Invisible Layer: Selectable text at matching OCR bounding boxes with text render mode 3
+    """
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
+    except ImportError:
+        pil_images = [Image.open(p).convert("RGB") for p in page_paths if p.exists()]
+        if pil_images:
+            first = pil_images[0]
+            rest = pil_images[1:] if len(pil_images) > 1 else []
+            first.save(str(out_pdf_path), "PDF", resolution=150.0, save_all=True, append_images=rest)
+            return
+
+    c = canvas.Canvas(str(out_pdf_path))
+    a4_w, a4_h = A4
+
+    for p_path in page_paths:
+        if not p_path.exists():
+            continue
+        try:
+            with Image.open(p_path) as im:
+                img_w, img_h = im.size
+        except Exception:
+            continue
+
+        scale = min(a4_w / img_w, a4_h / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+        margin_x = (a4_w - draw_w) / 2.0
+        margin_y = (a4_h - draw_h) / 2.0
+
+        c.setPageSize(A4)
+        c.drawImage(str(p_path), margin_x, margin_y, width=draw_w, height=draw_h)
+
+        if HAS_OCR and ocr_engine is not None:
+            try:
+                out = ocr_engine(str(p_path))
+                lines = []
+                boxes = []
+                if hasattr(out, "txts") and out.txts:
+                    lines = list(out.txts)
+                    if hasattr(out, "boxes") and out.boxes is not None:
+                        boxes = [b.tolist() if hasattr(b, "tolist") else b for b in out.boxes]
+                elif isinstance(out, tuple) and out[0]:
+                    lines = [r[1] for r in out[0]]
+                    boxes = [r[0] for r in out[0]]
+
+                for line_str, box in zip(lines, boxes):
+                    if not line_str or not box or len(box) < 4:
+                        continue
+                    bx0 = min(pt[0] for pt in box)
+                    by0 = min(pt[1] for pt in box)
+                    bx1 = max(pt[0] for pt in box)
+                    by1 = max(pt[1] for pt in box)
+                    box_h = by1 - by0
+
+                    pdf_x = margin_x + (bx0 * scale)
+                    pdf_y = margin_y + ((img_h - by1) * scale)
+                    font_size = max(5.0, (box_h * scale) * 0.85)
+
+                    text_obj = c.beginText()
+                    text_obj.setTextRenderMode(3)  # Invisible searchable text
+                    text_obj.setFont("Helvetica", font_size)
+                    text_obj.setTextOrigin(pdf_x, pdf_y)
+                    text_obj.textLine(line_str)
+                    c.drawText(text_obj)
+            except Exception as ocr_err:
+                print(f"[Warning] Dual-layer OCR pass skipped for page {p_path.name}: {ocr_err}")
+
+        c.showPage()
+
+    c.save()
+
+
 @app.get("/api/documents/{doc_id}/export-pdf")
 async def export_document_pdf(doc_id: str, download: bool = False):
-    """Compiles all pages into a crisp standardized A4 multi-page PDF."""
+    """Compiles all pages into a crisp standardized A4 dual-layer searchable PDF."""
     db = load_db()
     target = None
     for d in db.get("documents", []):
@@ -619,28 +730,13 @@ async def export_document_pdf(doc_id: str, download: bool = False):
     pdf_filename = f"{doc_id}.pdf"
     out_pdf_path = PDF_DIR / pdf_filename
 
-    pil_images = []
-    for page in target["pages"]:
-        p_path = PAGE_DIR / f"{page['id']}.jpg"
-        if p_path.exists():
-            im = Image.open(p_path)
-            if im.mode != "RGB":
-                im = im.convert("RGB")
-            pil_images.append(im)
+    page_paths = [PAGE_DIR / f"{page['id']}.jpg" for page in target["pages"]]
+    page_paths = [p for p in page_paths if p.exists()]
 
-    if not pil_images:
+    if not page_paths:
         raise HTTPException(status_code=400, detail="No readable page images found on disk.")
 
-    first = pil_images[0]
-    rest = pil_images[1:] if len(pil_images) > 1 else []
-
-    first.save(
-        str(out_pdf_path),
-        "PDF",
-        resolution=150.0,
-        save_all=True,
-        append_images=rest,
-    )
+    create_dual_layer_searchable_pdf(page_paths, out_pdf_path)
 
     clean_title = target["title"].replace(" ", "_")
     download_name = f"{clean_title}.pdf"
@@ -651,6 +747,119 @@ async def export_document_pdf(doc_id: str, download: bool = False):
         filename=download_name,
         headers={"Content-Disposition": f"{'attachment' if download else 'inline'}; filename={download_name}"},
     )
+
+
+@app.get("/api/documents/{doc_id}/export-txt")
+async def export_document_txt(doc_id: str):
+    """Extracts OCR text from all pages and returns as a downloadable text document."""
+    db = load_db()
+    target = None
+    for d in db.get("documents", []):
+        if d["id"] == doc_id:
+            target = d
+            break
+
+    if not target or not target.get("pages"):
+        raise HTTPException(status_code=404, detail="Document or pages not found.")
+
+    text_sections = []
+    text_sections.append(f"=== {target.get('title', 'Document')} ===")
+    text_sections.append(f"Category: {target.get('category', 'General')}")
+    text_sections.append(f"Pages: {len(target.get('pages', []))}\n")
+
+    for idx, page in enumerate(target.get("pages", [])):
+        p_path = PAGE_DIR / f"{page['id']}.jpg"
+        text_sections.append(f"--- [Page {idx + 1}] ---")
+        if p_path.exists() and HAS_OCR and ocr_engine is not None:
+            try:
+                out = ocr_engine(str(p_path))
+                if hasattr(out, "txts") and out.txts:
+                    text_sections.extend(list(out.txts))
+                elif isinstance(out, tuple) and out[0]:
+                    text_sections.extend([r[1] for r in out[0]])
+                else:
+                    text_sections.append("[No text detected on this page]")
+            except Exception as e:
+                text_sections.append(f"[OCR Error: {e}]")
+        else:
+            text_sections.append("[Page unavailable or OCR disabled]")
+        text_sections.append("")
+
+    full_body = "\n".join(text_sections)
+    clean_title = target["title"].replace(" ", "_")
+    return Response(
+        content=full_body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={clean_title}_ocr.txt"},
+    )
+
+
+class IDCardPayload(BaseModel):
+    front_page_id: str
+    back_page_id: str
+    title: Optional[str] = "ID Card (Front & Back)"
+    category: Optional[str] = "ID Card"
+
+
+@app.post("/api/scan/id-card")
+async def create_id_card_composite(payload: IDCardPayload):
+    """Composes Front and Back ID cards scaled 1:1 onto a single 300 DPI A4 page."""
+    front_path = PAGE_DIR / f"{payload.front_page_id}.jpg"
+    back_path = PAGE_DIR / f"{payload.back_page_id}.jpg"
+
+    if not front_path.exists() or not back_path.exists():
+        raise HTTPException(status_code=404, detail="Front or back card page not found.")
+
+    front_img = cv2.imread(str(front_path))
+    back_img = cv2.imread(str(back_path))
+
+    a4_w, a4_h = 2480, 3508
+    composite = np.full((a4_h, a4_w, 3), 255, dtype=np.uint8)
+
+    card_w, card_h = 1011, 638
+    front_scaled = cv2.resize(front_img, (card_w, card_h), interpolation=cv2.INTER_LANCZOS4)
+    back_scaled = cv2.resize(back_img, (card_w, card_h), interpolation=cv2.INTER_LANCZOS4)
+
+    x_offset = (a4_w - card_w) // 2
+    y_front = 550
+    y_back = 1950
+
+    composite[y_front:y_front + card_h, x_offset:x_offset + card_w] = front_scaled
+    composite[y_back:y_back + card_h, x_offset:x_offset + card_w] = back_scaled
+
+    cv2.rectangle(composite, (x_offset - 6, y_front - 6), (x_offset + card_w + 6, y_front + card_h + 6), (220, 220, 220), 2)
+    cv2.rectangle(composite, (x_offset - 6, y_back - 6), (x_offset + card_w + 6, y_back + card_h + 6), (220, 220, 220), 2)
+    cv2.putText(composite, "CARD FRONT", (x_offset, y_front - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+    cv2.putText(composite, "CARD BACK", (x_offset, y_back - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+    cv2.putText(composite, "CamScanner Pro - ID Card 1:1 Scale", (x_offset, 250), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (24, 154, 128), 3)
+
+    composite_id = f"id_card_{uuid.uuid4().hex[:10]}"
+    comp_page_file = f"{composite_id}.jpg"
+    comp_thumb_file = f"{composite_id}_thumb.jpg"
+
+    cv2.imwrite(str(PAGE_DIR / comp_page_file), composite, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    thumb = cv2.resize(composite, (240, 340), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(str(THUMB_DIR / comp_thumb_file), thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    db = load_db()
+    doc_id = f"doc_{uuid.uuid4().hex[:10]}"
+    doc = {
+        "id": doc_id,
+        "title": payload.title,
+        "category": payload.category or "ID Card",
+        "created_at": int(datetime.now().timestamp() * 1000),
+        "updated_at": int(datetime.now().timestamp() * 1000),
+        "pages": [
+            {
+                "id": composite_id,
+                "url": f"/files/pages/{comp_page_file}",
+                "thumbnail_url": f"/files/thumbnails/{comp_thumb_file}",
+            }
+        ],
+    }
+    db.setdefault("documents", []).insert(0, doc)
+    save_db(db)
+    return doc
 
 
 # ==========================================
@@ -937,6 +1146,22 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span class="text-[11px] text-slate-300">Lighten</span>
         </button>
 
+        <!-- Dewarp (Curved Book) -->
+        <button data-filter="dewarp" class="filter-pill flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border border-transparent hover:border-slate-700 transition">
+          <div class="w-12 h-12 rounded-lg bg-teal-700 flex items-center justify-center text-white shadow">
+            <i data-lucide="book-open" class="w-6 h-6"></i>
+          </div>
+          <span class="text-[11px] text-slate-300">Dewarp Book</span>
+        </button>
+
+        <!-- Clean Print (Handwriting Removal) -->
+        <button data-filter="clean_print" class="filter-pill flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border border-transparent hover:border-slate-700 transition">
+          <div class="w-12 h-12 rounded-lg bg-indigo-700 flex items-center justify-center text-white shadow">
+            <i data-lucide="printer" class="w-6 h-6"></i>
+          </div>
+          <span class="text-[11px] text-slate-300">Clean Print</span>
+        </button>
+
         <!-- Original -->
         <button data-filter="original" class="filter-pill flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border border-transparent hover:border-slate-700 transition">
           <div class="w-12 h-12 rounded-lg bg-blue-600 flex items-center justify-center text-white shadow">
@@ -984,9 +1209,14 @@ HTML_CONTENT = """<!DOCTYPE html>
         <span>Add Page</span>
       </button>
 
+      <button id="btn-export-txt" class="py-3 px-3.5 rounded-xl bg-slate-850 hover:bg-slate-800 text-slate-200 hover:text-white font-semibold text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition">
+        <i data-lucide="file-text" class="w-4 h-4 text-emerald-400"></i>
+        <span>OCR TXT</span>
+      </button>
+
       <button id="btn-export-pdf" class="flex-1 py-3 px-4 rounded-xl bg-brand text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-lg shadow-brand/30 hover:bg-brand-light active:scale-98 transition">
         <i data-lucide="file-down" class="w-5 h-5"></i>
-        <span>Export PDF</span>
+        <span>Searchable PDF</span>
       </button>
     </footer>
   </div>
@@ -1620,6 +1850,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     document.getElementById('btn-export-pdf').onclick = () => {
       if (state.activeDoc) {
         window.open(`/api/documents/${state.activeDoc.id}/export-pdf?download=true`, '_blank');
+      }
+    };
+
+    document.getElementById('btn-export-txt').onclick = () => {
+      if (state.activeDoc) {
+        window.open(`/api/documents/${state.activeDoc.id}/export-txt`, '_blank');
       }
     };
 
