@@ -862,6 +862,73 @@ async def create_id_card_composite(payload: IDCardPayload):
     return doc
 
 
+@app.post("/api/scan/id-card-files")
+async def create_id_card_from_files(
+    front: UploadFile = File(...),
+    back: UploadFile = File(...),
+    title: Optional[str] = Form("ID Card (Front & Back)"),
+):
+    """Composes uploaded Front and Back ID photos directly into a 1:1 scale A4 composite document."""
+    front_bytes = await front.read()
+    back_bytes = await back.read()
+
+    front_np = np.frombuffer(front_bytes, np.uint8)
+    back_np = np.frombuffer(back_bytes, np.uint8)
+    front_img = cv2.imdecode(front_np, cv2.IMREAD_COLOR)
+    back_img = cv2.imdecode(back_np, cv2.IMREAD_COLOR)
+
+    if front_img is None or back_img is None:
+        raise HTTPException(status_code=400, detail="Invalid image file(s) for front or back ID.")
+
+    a4_w, a4_h = 2480, 3508
+    composite = np.full((a4_h, a4_w, 3), 255, dtype=np.uint8)
+
+    card_w, card_h = 1011, 638
+    front_scaled = cv2.resize(front_img, (card_w, card_h), interpolation=cv2.INTER_LANCZOS4)
+    back_scaled = cv2.resize(back_img, (card_w, card_h), interpolation=cv2.INTER_LANCZOS4)
+
+    x_offset = (a4_w - card_w) // 2
+    y_front = 550
+    y_back = 1950
+
+    composite[y_front:y_front + card_h, x_offset:x_offset + card_w] = front_scaled
+    composite[y_back:y_back + card_h, x_offset:x_offset + card_w] = back_scaled
+
+    cv2.rectangle(composite, (x_offset - 6, y_front - 6), (x_offset + card_w + 6, y_front + card_h + 6), (220, 220, 220), 2)
+    cv2.rectangle(composite, (x_offset - 6, y_back - 6), (x_offset + card_w + 6, y_back + card_h + 6), (220, 220, 220), 2)
+    cv2.putText(composite, "CARD FRONT", (x_offset, y_front - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+    cv2.putText(composite, "CARD BACK", (x_offset, y_back - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+    cv2.putText(composite, "CamScanner Pro - ID Card 1:1 Scale", (x_offset, 250), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (24, 154, 128), 3)
+
+    composite_id = f"id_card_{uuid.uuid4().hex[:10]}"
+    comp_page_file = f"{composite_id}.jpg"
+    comp_thumb_file = f"{composite_id}_thumb.jpg"
+
+    cv2.imwrite(str(PAGE_DIR / comp_page_file), composite, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    thumb = cv2.resize(composite, (240, 340), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(str(THUMB_DIR / comp_thumb_file), thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    db = load_db()
+    doc_id = f"doc_{uuid.uuid4().hex[:10]}"
+    doc = {
+        "id": doc_id,
+        "title": title or "ID Card (Front & Back)",
+        "category": "ID Card",
+        "created_at": int(datetime.now().timestamp() * 1000),
+        "updated_at": int(datetime.now().timestamp() * 1000),
+        "pages": [
+            {
+                "id": composite_id,
+                "url": f"/files/pages/{comp_page_file}",
+                "thumbnail_url": f"/files/thumbnails/{comp_thumb_file}",
+            }
+        ],
+    }
+    db.setdefault("documents", []).insert(0, doc)
+    save_db(db)
+    return doc
+
+
 # ==========================================
 # Frontend Dashboard (CamScanner Mobile & Web UI)
 # ==========================================
@@ -874,8 +941,8 @@ HTML_CONTENT = """<!DOCTYPE html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.json">
-  <link rel="icon" type="image/svg+xml" href="/icon.svg">
-  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="apple-touch-icon" href="/static/logo_192.png">
   <title>CamScanner Pro</title>
 
   <!-- Tailwind CSS -->
@@ -952,9 +1019,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- Header -->
     <header class="bg-brand-surface border-b border-slate-800 px-4 py-3 flex items-center justify-between shadow-md">
       <div class="flex items-center space-x-2.5">
-        <div class="w-9 h-9 rounded-lg bg-brand flex items-center justify-center text-white shadow-md shadow-brand/20">
-          <i data-lucide="scan" class="w-5 h-5"></i>
-        </div>
+        <img src="/static/logo_192.png" alt="CamScanner Logo" class="w-9 h-9 rounded-xl shadow-md border border-slate-700/60 object-contain p-0.5 bg-slate-900">
         <div>
           <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-1.5">
             CamScanner <span class="text-[10px] px-1.5 py-0.5 rounded bg-brand/20 text-brand-light font-semibold border border-brand/30">PRO</span>
@@ -985,19 +1050,21 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
 
     <!-- Category Pills -->
-    <div class="px-4 py-2.5 flex space-x-2 overflow-x-auto no-scrollbar border-b border-slate-900 bg-brand-bg/50">
-      <button class="px-3 py-1 rounded-full text-xs font-semibold bg-brand text-white shadow-sm">All Docs</button>
-      <button class="px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800">Invoices</button>
-      <button class="px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800">ID Cards</button>
-      <button class="px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800">Notes</button>
+    <div class="px-4 py-2.5 flex space-x-2 overflow-x-auto no-scrollbar border-b border-slate-900 bg-brand-bg/50" id="category-pills">
+      <button class="cat-pill active px-3 py-1 rounded-full text-xs font-semibold bg-brand text-white shadow-sm transition" onclick="filterCategory('All', this)">All Docs</button>
+      <button class="cat-pill px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800 transition" onclick="filterCategory('Invoice', this)">Invoices</button>
+      <button class="cat-pill px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-brand-light hover:bg-slate-800 flex items-center gap-1 transition" onclick="openIDCardModal()">
+        <i data-lucide="credit-card" class="w-3.5 h-3.5"></i>
+        <span>ID Card</span>
+      </button>
+      <button class="cat-pill px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800 transition" onclick="filterCategory('Book', this)">Books</button>
+      <button class="cat-pill px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 text-slate-300 hover:bg-slate-800 transition" onclick="filterCategory('Note', this)">Notes</button>
     </div>
 
     <!-- Document List Container -->
     <main class="flex-1 overflow-y-auto px-4 py-3 space-y-3" id="doc-list-container">
-      <div id="empty-state" class="hidden flex flex-col items-center justify-center h-full text-center py-20 px-4">
-        <div class="w-20 h-20 rounded-full bg-slate-800/60 border border-slate-700/50 flex items-center justify-center mb-4 text-brand">
-          <i data-lucide="file-plus" class="w-10 h-10"></i>
-        </div>
+      <div id="empty-state" class="hidden flex flex-col items-center justify-center h-full text-center py-16 px-4">
+        <img src="/static/official/ic_scanner_empty_doc-BWsAcaxT.png" alt="No Documents" class="w-36 h-36 object-contain mb-3 opacity-90 drop-shadow-md">
         <h3 class="text-base font-semibold text-slate-200">No Scanned Documents</h3>
         <p class="text-xs text-slate-400 mt-1 max-w-xs">
           Tap the emerald camera button below to take a photo or select an image from your gallery.
@@ -1007,6 +1074,10 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     <!-- Floating Action Button (CamScanner Signature Emerald Button) -->
     <div class="fixed bottom-6 right-6 z-20 flex flex-col items-end gap-3">
+      <button id="btn-idcard" onclick="openIDCardModal()" class="w-12 h-12 rounded-full bg-slate-800 border border-slate-700 text-brand-light shadow-xl flex items-center justify-center hover:bg-slate-700 active:scale-95 transition" title="ID Card Front & Back (1:1 A4)">
+        <i data-lucide="credit-card" class="w-5 h-5"></i>
+      </button>
+
       <button id="btn-gallery" class="w-12 h-12 rounded-full bg-slate-800 border border-slate-700 text-slate-200 shadow-xl flex items-center justify-center hover:bg-slate-700 active:scale-95 transition" title="Upload from Gallery">
         <i data-lucide="image" class="w-5 h-5"></i>
       </button>
@@ -1245,6 +1316,66 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ID Card Scanner Modal -->
+  <div id="modal-idcard" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-brand-surface border border-slate-700 w-full max-w-md rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+      <div class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between">
+        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+          <i data-lucide="credit-card" class="w-4 h-4 text-brand-light"></i>
+          <span>ID Card Scanner (1:1 Scale A4)</span>
+        </h3>
+        <button onclick="closeIDCardModal()" class="text-slate-400 hover:text-white">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <div class="p-4 space-y-3.5">
+        <p class="text-xs text-slate-300">
+          Combines Front and Back of your ID card into a standard ISO-7810 1:1 scale composite sheet, ready for printing.
+        </p>
+
+        <!-- Front Side -->
+        <div>
+          <span class="text-xs font-semibold text-slate-300 block mb-1">1. Card Front</span>
+          <div id="idcard-front-box" onclick="document.getElementById('idcard-front-input').click()" class="h-28 border-2 border-dashed border-slate-700 hover:border-brand/70 rounded-xl bg-slate-900/60 flex flex-col items-center justify-center cursor-pointer overflow-hidden transition relative">
+            <img id="idcard-front-preview" class="hidden w-full h-full object-contain">
+            <div id="idcard-front-placeholder" class="flex flex-col items-center text-slate-400">
+              <i data-lucide="camera" class="w-6 h-6 text-brand-light mb-1"></i>
+              <span class="text-xs">Tap to upload / capture Front</span>
+            </div>
+          </div>
+          <input type="file" id="idcard-front-input" accept="image/*" class="hidden" onchange="previewIDCardSide(event, 'front')">
+        </div>
+
+        <!-- Back Side -->
+        <div>
+          <span class="text-xs font-semibold text-slate-300 block mb-1">2. Card Back</span>
+          <div id="idcard-back-box" onclick="document.getElementById('idcard-back-input').click()" class="h-28 border-2 border-dashed border-slate-700 hover:border-brand/70 rounded-xl bg-slate-900/60 flex flex-col items-center justify-center cursor-pointer overflow-hidden transition relative">
+            <img id="idcard-back-preview" class="hidden w-full h-full object-contain">
+            <div id="idcard-back-placeholder" class="flex flex-col items-center text-slate-400">
+              <i data-lucide="camera" class="w-6 h-6 text-brand-light mb-1"></i>
+              <span class="text-xs">Tap to upload / capture Back</span>
+            </div>
+          </div>
+          <input type="file" id="idcard-back-input" accept="image/*" class="hidden" onchange="previewIDCardSide(event, 'back')">
+        </div>
+
+        <div>
+          <label class="text-xs font-semibold text-slate-300 block mb-1">Document Title</label>
+          <input type="text" id="idcard-title-input" value="ID Card (Front & Back)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand">
+        </div>
+      </div>
+
+      <div class="p-3 border-t border-slate-800 flex justify-end gap-2 bg-slate-900/40">
+        <button onclick="closeIDCardModal()" class="px-3.5 py-2 rounded-xl text-xs font-medium text-slate-400 hover:text-white">Cancel</button>
+        <button id="btn-submit-idcard" onclick="submitIDCard()" class="px-4 py-2 rounded-xl bg-brand text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-brand-light active:scale-95 transition disabled:opacity-50">
+          <i data-lucide="layers" class="w-4 h-4"></i>
+          <span>Create 1:1 Composite</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Frontend Logic -->
   <script>
     const state = {
@@ -1252,6 +1383,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       documents: [],
       activeDoc: null,
       isAddingPage: false,
+      selectedCategory: 'All',
+      idCardFiles: { front: null, back: null },
 
       // Current scan upload session
       uploadId: null,
@@ -1286,6 +1419,85 @@ HTML_CONTENT = """<!DOCTYPE html>
       setTimeout(() => lucide.createIcons(), 50);
     }
 
+    function filterCategory(category, elem) {
+      state.selectedCategory = category;
+      document.querySelectorAll('#category-pills .cat-pill').forEach(btn => {
+        btn.classList.remove('active', 'bg-brand', 'text-white', 'shadow-sm');
+        btn.classList.add('bg-slate-800/80', 'text-slate-300');
+      });
+      if (elem) {
+        elem.classList.add('active', 'bg-brand', 'text-white', 'shadow-sm');
+        elem.classList.remove('bg-slate-800/80', 'text-slate-300');
+      }
+      renderDocuments();
+    }
+
+    function openIDCardModal() {
+      state.idCardFiles = { front: null, back: null };
+      document.getElementById('idcard-front-input').value = '';
+      document.getElementById('idcard-back-input').value = '';
+      document.getElementById('idcard-front-preview').classList.add('hidden');
+      document.getElementById('idcard-front-placeholder').classList.remove('hidden');
+      document.getElementById('idcard-back-preview').classList.add('hidden');
+      document.getElementById('idcard-back-placeholder').classList.remove('hidden');
+      document.getElementById('modal-idcard').classList.remove('hidden');
+      lucide.createIcons();
+    }
+
+    function closeIDCardModal() {
+      document.getElementById('modal-idcard').classList.add('hidden');
+    }
+
+    function previewIDCardSide(event, side) {
+      const file = event.target.files[0];
+      if (!file) return;
+      state.idCardFiles[side] = file;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const preview = document.getElementById(`idcard-${side}-preview`);
+        const placeholder = document.getElementById(`idcard-${side}-placeholder`);
+        preview.src = e.target.result;
+        preview.classList.remove('hidden');
+        placeholder.classList.add('hidden');
+      };
+      reader.readAsDataURL(file);
+    }
+
+    async function submitIDCard() {
+      if (!state.idCardFiles.front || !state.idCardFiles.back) {
+        alert('Please provide photos or scans for both Front and Back sides of the card.');
+        return;
+      }
+      const title = document.getElementById('idcard-title-input').value.trim() || 'ID Card (Front & Back)';
+      const btn = document.getElementById('btn-submit-idcard');
+      btn.disabled = true;
+      btn.innerHTML = '<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i><span>Composing 1:1 A4...</span>';
+      lucide.createIcons();
+
+      const formData = new FormData();
+      formData.append('front', state.idCardFiles.front);
+      formData.append('back', state.idCardFiles.back);
+      formData.append('title', title);
+
+      try {
+        const res = await fetch('/api/scan/id-card-files', {
+          method: 'POST',
+          body: formData
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const doc = await res.json();
+        closeIDCardModal();
+        await fetchDocuments();
+        openDocumentDetail(doc);
+      } catch (err) {
+        alert('Failed to generate ID card composite: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i data-lucide="layers" class="w-4 h-4"></i><span>Create 1:1 Composite</span>';
+        lucide.createIcons();
+      }
+    }
+
     async function fetchDocuments() {
       try {
         const res = await fetch('/api/documents');
@@ -1302,9 +1514,13 @@ HTML_CONTENT = """<!DOCTYPE html>
       const emptyState = document.getElementById('empty-state');
       const counter = document.getElementById('doc-counter');
 
-      const docs = query
-        ? state.documents.filter(d => d.title.toLowerCase().includes(query.toLowerCase()))
-        : state.documents;
+      let docs = state.documents;
+      if (state.selectedCategory && state.selectedCategory.toLowerCase() !== 'all') {
+        docs = docs.filter(d => (d.category || '').toLowerCase() === state.selectedCategory.toLowerCase());
+      }
+      if (query) {
+        docs = docs.filter(d => d.title.toLowerCase().includes(query.toLowerCase()));
+      }
 
       counter.textContent = `${docs.length} ${docs.length === 1 ? 'document' : 'documents'}`;
 
@@ -1337,6 +1553,7 @@ HTML_CONTENT = """<!DOCTYPE html>
               <span class="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium">
                 ${pCount} ${pCount === 1 ? 'page' : 'pages'}
               </span>
+              ${doc.category ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-brand/15 text-brand-light font-medium border border-brand/20">${escapeHtml(doc.category)}</span>` : ''}
             </div>
           </div>
           <button class="btn-menu p-2 text-slate-400 hover:text-white rounded-full hover:bg-slate-800" data-id="${doc.id}">
@@ -1953,14 +2170,29 @@ async def manifest():
             "start_url": "/",
             "display": "standalone",
             "orientation": "portrait",
-            "background_color": "#020617",
+            "background_color": "#0f1115",
             "theme_color": "#189a80",
             "icons": [
                 {
-                    "src": "/icon.svg",
-                    "sizes": "192x192 512x512",
-                    "type": "image/svg+xml",
+                    "src": "/static/logo_192.png",
+                    "sizes": "192x192",
+                    "type": "image/png",
                     "purpose": "any maskable"
+                },
+                {
+                    "src": "/static/logo_96.png",
+                    "sizes": "96x96",
+                    "type": "image/png"
+                },
+                {
+                    "src": "/static/favicon.png",
+                    "sizes": "48x48",
+                    "type": "image/png"
+                },
+                {
+                    "src": "/icon.svg",
+                    "sizes": "512x512",
+                    "type": "image/svg+xml"
                 }
             ]
         }
@@ -1994,10 +2226,13 @@ async def icon_svg():
 @app.get("/sw.js")
 async def service_worker():
     sw_code = """
-const CACHE_NAME = 'camscanner-v2';
+const CACHE_NAME = 'camscanner-v3';
 const ASSETS = [
   '/',
   '/manifest.json',
+  '/static/favicon.png',
+  '/static/logo_192.png',
+  '/static/official/ic_scanner_empty_doc-BWsAcaxT.png',
   '/icon.svg',
   'https://cdn.tailwindcss.com',
   'https://unpkg.com/lucide@latest'

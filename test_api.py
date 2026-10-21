@@ -171,6 +171,26 @@ def test_id_card_composite(page_id):
     client.delete(f"/api/documents/{id_doc['id']}")
 
 
+def test_id_card_from_files():
+    img_bytes = create_synthetic_document_image()
+    res = client.post(
+        "/api/scan/id-card-files",
+        files={
+            "front": ("card_front.jpg", img_bytes, "image/jpeg"),
+            "back": ("card_back.jpg", img_bytes, "image/jpeg")
+        },
+        data={"title": "Uploaded ID Card 1:1 Test"}
+    )
+    assert res.status_code == 200, res.text
+    doc = res.json()
+    assert doc["category"] == "ID Card"
+    assert len(doc["pages"]) == 1
+    print("\n[OK] Direct ID Card Upload 1:1 Composite passed! Doc ID:", doc["id"])
+
+    # Clean up
+    client.delete(f"/api/documents/{doc['id']}")
+
+
 if __name__ == "__main__":
     print("Running CamScanner Pro Extended Pipeline Test Suite...")
     upload_id, corners = test_upload_and_detect_corners()
@@ -178,6 +198,7 @@ if __name__ == "__main__":
     test_dewarp_and_clean_print_filters(upload_id, corners)
     test_ocr_extraction(page_id)
     test_id_card_composite(page_id)
+    test_id_card_from_files()
     test_document_lifecycle_and_dual_layer_pdf(page_id)
     print("\n=======================================================")
     print("  ALL EXTENDED CAMSCANNER PRO TESTS PASSED 100%!")
