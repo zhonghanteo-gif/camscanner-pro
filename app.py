@@ -211,6 +211,19 @@ def apply_camscanner_filter(
         merged = cv2.merge([l_sharp, a_boost, b_boost])
         res = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
+    elif filter_type == "no_shadow":
+        # Official CamScanner "No Shadow" illumination flattening without harsh thresholding
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        h, w = l.shape[:2]
+        k_size = max(21, (min(h, w) // 30) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+        dilated = cv2.dilate(l, kernel)
+        bg = cv2.GaussianBlur(dilated, (k_size, k_size), 0)
+        norm_l = np.clip((l.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0)) * 240.0, 0, 255).astype(np.uint8)
+        merged = cv2.merge([norm_l, a, b])
+        res = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
     elif filter_type == "dewarp" or filter_type == "curved_book":
         # Cylindrical dewarping for curved pages / book spines
         h, w = img.shape[:2]
@@ -937,7 +950,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <meta name="theme-color" content="#189a80">
+  <meta name="theme-color" content="#00b796">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.json">
@@ -953,11 +966,11 @@ HTML_CONTENT = """<!DOCTYPE html>
         extend: {
           colors: {
             brand: {
-              DEFAULT: '#189a80',
-              dark: '#127a65',
-              light: '#22b598',
-              surface: '#181b22',
-              card: '#212530',
+              DEFAULT: '#00b796',
+              dark: '#00977c',
+              light: '#19bcaa',
+              surface: '#15171c',
+              card: '#1e222a',
               bg: '#0f1115'
             }
           }
@@ -970,7 +983,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <style>
     :root {
-      --brand: #189a80;
+      --brand: #00b796;
     }
     body {
       -webkit-tap-highlight-color: transparent;
@@ -987,17 +1000,17 @@ HTML_CONTENT = """<!DOCTYPE html>
       cursor: crosshair;
     }
     #magnifier-loupe {
-      box-shadow: 0 10px 30px -5px rgba(0,0,0,0.8), 0 0 0 3px rgba(24, 154, 128, 0.7);
+      box-shadow: 0 10px 30px -5px rgba(0,0,0,0.8), 0 0 0 3px rgba(0, 183, 150, 0.7);
       pointer-events: none;
       transform: translate(-50%, -100%);
       transition: opacity 0.15s ease-out;
     }
     .filter-pill.active {
-      border-color: #189a80 !important;
-      background-color: rgba(24, 154, 128, 0.15) !important;
+      border-color: #00b796 !important;
+      background-color: rgba(0, 183, 150, 0.15) !important;
     }
     .filter-pill.active span {
-      color: #22b598 !important;
+      color: #19bcaa !important;
       font-weight: 700;
     }
     input[type="range"] {
@@ -1006,7 +1019,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none; appearance: none;
       width: 16px; height: 16px; border-radius: 50%;
-      background: #189a80; cursor: pointer; border: 2px solid white;
+      background: #00b796; cursor: pointer; border: 2px solid white;
     }
   </style>
 </head>
@@ -1183,6 +1196,14 @@ HTML_CONTENT = """<!DOCTYPE html>
             <i data-lucide="wand-2" class="w-6 h-6"></i>
           </div>
           <span class="text-[11px] font-semibold text-brand-light">Magic Color</span>
+        </button>
+
+        <!-- No Shadow (CamScanner Illumination Flattening) -->
+        <button data-filter="no_shadow" class="filter-pill flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border border-transparent hover:border-slate-700 transition">
+          <div class="w-12 h-12 rounded-lg bg-teal-800 flex items-center justify-center text-white shadow">
+            <i data-lucide="sun-medium" class="w-6 h-6"></i>
+          </div>
+          <span class="text-[11px] text-slate-300">No Shadow</span>
         </button>
 
         <!-- B&W Clean -->

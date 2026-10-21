@@ -99,6 +99,17 @@ def test_dewarp_and_clean_print_filters(upload_id, corners):
     assert print_res.status_code == 200, print_res.text
     print("\n[OK] Clean Print (Handwriting removal) passed:", print_res.json()["page_id"])
 
+    # Test No Shadow
+    shadow_res = client.post("/api/scan/warp-filter", json={
+        "upload_id": upload_id,
+        "corners": corners,
+        "filter_type": "no_shadow",
+        "brightness": 0,
+        "contrast": 0
+    })
+    assert shadow_res.status_code == 200, shadow_res.text
+    print("\n[OK] No Shadow filter passed:", shadow_res.json()["page_id"])
+
 
 def test_ocr_extraction(page_id):
     response = client.post(f"/api/scan/ocr/{page_id}")
