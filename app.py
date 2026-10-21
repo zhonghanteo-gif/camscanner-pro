@@ -977,9 +977,11 @@ async def apply_document_watermark(doc_id: str, payload: WatermarkPayload):
 
 class SignaturePayload(BaseModel):
     page_id: str
-    signature_data: str
-    pos_x_pct: float = 0.60
-    pos_y_pct: float = 0.75
+    signature_data: Optional[str] = None
+    signature_base64: Optional[str] = None
+    position: Optional[str] = "br"
+    pos_x_pct: Optional[float] = None
+    pos_y_pct: Optional[float] = None
     scale_pct: float = 0.30
 
 
@@ -1000,7 +1002,10 @@ async def apply_document_signature(doc_id: str, payload: SignaturePayload):
     if not p_path.exists():
         raise HTTPException(status_code=404, detail="Page image not found.")
 
-    sig_raw = payload.signature_data
+    sig_raw = payload.signature_data or payload.signature_base64
+    if not sig_raw:
+        raise HTTPException(status_code=400, detail="Signature data required.")
+
     if "base64," in sig_raw:
         sig_raw = sig_raw.split("base64,")[1]
 
@@ -1015,8 +1020,23 @@ async def apply_document_signature(doc_id: str, payload: SignaturePayload):
     sig_h = int(sig_w * aspect)
     sig_resized = sig_img.resize((sig_w, sig_h), Image.LANCZOS)
 
-    pos_x = int(pw * payload.pos_x_pct)
-    pos_y = int(ph * payload.pos_y_pct)
+    pos_x_pct = payload.pos_x_pct
+    pos_y_pct = payload.pos_y_pct
+    if pos_x_pct is None or pos_y_pct is None:
+        p = (payload.position or "br").lower()
+        if p == "br":
+            pos_x_pct, pos_y_pct = 0.65, 0.78
+        elif p == "bl":
+            pos_x_pct, pos_y_pct = 0.08, 0.78
+        elif p == "bc":
+            pos_x_pct, pos_y_pct = 0.35, 0.78
+        elif p == "tr":
+            pos_x_pct, pos_y_pct = 0.65, 0.12
+        else:
+            pos_x_pct, pos_y_pct = 0.60, 0.75
+
+    pos_x = int(pw * pos_x_pct)
+    pos_y = int(ph * pos_y_pct)
     pos_x = max(0, min(pos_x, pw - sig_w))
     pos_y = max(0, min(pos_y, ph - sig_h))
 
@@ -2038,7 +2058,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         const updated = await res.json();
         closeWatermarkModal();
         await fetchDocuments();
-        openDocumentDetail(updated);
+        openDocumentDetail(updated.doc || updated);
       } catch (err) {
         alert('Failed to apply watermark: ' + err.message);
       } finally {
@@ -2186,7 +2206,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         const updated = await res.json();
         closeSignatureModal();
         await fetchDocuments();
-        openDocumentDetail(updated);
+        openDocumentDetail(updated.doc || updated);
       } catch (err) {
         alert('Failed to stamp signature: ' + err.message);
       } finally {
