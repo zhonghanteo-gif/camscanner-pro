@@ -358,6 +358,7 @@ class WarpFilterRequest(BaseModel):
     filter_type: str = "magic"
     brightness: int = 0
     contrast: int = 0
+    target_page_id: Optional[str] = None
 
 
 class DocumentCreateRequest(BaseModel):
@@ -408,6 +409,42 @@ async def upload_scan_image(file: UploadFile = File(...)):
     }
 
 
+@app.post("/api/scan/redetect-corners/{upload_id}")
+async def redetect_upload_corners(upload_id: str):
+    """Re-analyzes source upload with OpenCV contour detection to re-snap document edges."""
+    src_file = UPLOAD_DIR / upload_id
+    if not src_file.exists():
+        raise HTTPException(status_code=404, detail="Upload image not found.")
+    img_bgr = cv2.imread(str(src_file))
+    if img_bgr is None:
+        raise HTTPException(status_code=500, detail="Could not read source upload.")
+    corners = detect_document_corners(img_bgr)
+    return {"corners": corners}
+
+
+@app.post("/api/pages/{page_id}/prepare-edit")
+async def prepare_page_for_edit(page_id: str):
+    """Prepares an existing scanned page for interactive re-cropping and filter fine-tuning."""
+    page_file = PAGE_DIR / f"{page_id}.jpg"
+    if not page_file.exists():
+        raise HTTPException(status_code=404, detail="Page not found.")
+    img_bgr = cv2.imread(str(page_file))
+    if img_bgr is None:
+        raise HTTPException(status_code=500, detail="Could not read page image.")
+    h, w = img_bgr.shape[:2]
+    edit_upload_id = f"edit_{page_id}.jpg"
+    shutil.copyfile(str(page_file), str(UPLOAD_DIR / edit_upload_id))
+    corners = detect_document_corners(img_bgr)
+    return {
+        "upload_id": edit_upload_id,
+        "page_id": page_id,
+        "width": w,
+        "height": h,
+        "corners": corners,
+        "url": f"/files/uploads/{edit_upload_id}"
+    }
+
+
 @app.post("/api/scan/warp-filter")
 async def warp_and_filter_document(payload: WarpFilterRequest):
     """Warps quadrilateral region into a flat document and applies CamScanner enhancement filters."""
@@ -428,7 +465,7 @@ async def warp_and_filter_document(payload: WarpFilterRequest):
         contrast=payload.contrast,
     )
 
-    page_id = f"page_{uuid.uuid4().hex[:12]}"
+    page_id = payload.target_page_id or f"page_{uuid.uuid4().hex[:12]}"
     page_filename = f"{page_id}.jpg"
     thumb_filename = f"{page_id}_thumb.jpg"
 
@@ -1743,7 +1780,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
         <div>
           <label class="text-xs font-semibold text-slate-300 block mb-1">Watermark Text</label>
-          <input type="text" id="watermark-text-input" value="FOR VERIFICATION ONLY" placeholder="e.g. CONFIDENTIAL, VISA ONLY" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand">
+          <input type="text" id="wm-text-input" value="FOR VERIFICATION ONLY" placeholder="e.g. CONFIDENTIAL, VISA ONLY" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand">
         </div>
 
         <div>
@@ -1751,7 +1788,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <span>Watermark Opacity</span>
             <span id="wm-opacity-label">25%</span>
           </div>
-          <input type="range" id="watermark-opacity-slider" min="10" max="80" value="25" oninput="document.getElementById('wm-opacity-label').textContent = this.value + '%'" class="w-full accent-brand">
+          <input type="range" id="wm-opacity-slider" min="10" max="80" value="25" oninput="document.getElementById('wm-opacity-label').textContent = this.value + '%'" class="w-full accent-brand">
         </div>
 
         <div>
@@ -1844,6 +1881,100 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Full-Screen Page Viewer & Zoom Inspector Modal -->
+  <div id="modal-page-viewer" class="hidden fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col justify-between">
+    <header class="px-4 py-3 flex items-center justify-between bg-slate-900/80 border-b border-slate-800">
+      <button onclick="closePageViewer()" class="p-2 text-slate-300 hover:text-white rounded-full">
+        <i data-lucide="arrow-left" class="w-6 h-6"></i>
+      </button>
+      <div class="text-center">
+        <h3 id="pv-doc-title" class="text-xs font-bold text-white truncate max-w-[200px]">Page View</h3>
+        <span id="pv-page-index" class="text-[10px] text-brand-light font-medium">Page 1 of 1</span>
+      </div>
+      <button onclick="downloadActivePageImage()" class="p-2 text-slate-300 hover:text-brand-light rounded-full" title="Download High-Res Page">
+        <i data-lucide="download" class="w-5 h-5"></i>
+      </button>
+    </header>
+
+    <div class="flex-1 flex items-center justify-center p-2 overflow-hidden relative" id="pv-container">
+      <img id="pv-image" class="max-w-full max-h-full object-contain rounded-lg shadow-2xl transition duration-150">
+      <div id="pv-loading" class="hidden absolute inset-0 flex items-center justify-center bg-black/60">
+        <i data-lucide="loader-2" class="w-8 h-8 text-brand animate-spin"></i>
+      </div>
+    </div>
+
+    <footer class="bg-slate-900/90 border-t border-slate-800 px-4 py-3 pb-6 flex items-center justify-around text-xs">
+      <button onclick="pvExtractOcr()" class="flex flex-col items-center gap-1 text-slate-300 hover:text-emerald-400 transition py-1 px-2">
+        <i data-lucide="file-text" class="w-5 h-5 text-emerald-400"></i>
+        <span>OCR Text</span>
+      </button>
+      <button onclick="pvEditEnhancement()" class="flex flex-col items-center gap-1 text-slate-300 hover:text-brand-light transition py-1 px-2">
+        <i data-lucide="sliders" class="w-5 h-5 text-brand"></i>
+        <span>Re-Enhance</span>
+      </button>
+      <button onclick="pvOpenSignature()" class="flex flex-col items-center gap-1 text-slate-300 hover:text-blue-400 transition py-1 px-2">
+        <i data-lucide="pen-tool" class="w-5 h-5 text-blue-400"></i>
+        <span>Sign</span>
+      </button>
+      <button onclick="pvDeleteCurrentPage()" class="flex flex-col items-center gap-1 text-slate-300 hover:text-red-400 transition py-1 px-2">
+        <i data-lucide="trash-2" class="w-5 h-5 text-red-400"></i>
+        <span>Delete</span>
+      </button>
+    </footer>
+  </div>
+
+  <!-- Document Action Bottom Sheet -->
+  <div id="modal-doc-sheet" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end justify-center" onclick="if(event.target === this) closeDocSheet()">
+    <div class="bg-brand-surface border-t border-slate-700 w-full max-w-md rounded-t-3xl shadow-2xl overflow-hidden">
+      <div class="w-12 h-1 bg-slate-700 rounded-full mx-auto my-3"></div>
+      <div class="px-5 pb-3 border-b border-slate-800">
+        <h3 id="sheet-doc-title" class="text-sm font-bold text-white truncate">Document Actions</h3>
+        <p id="sheet-doc-meta" class="text-xs text-slate-400 mt-0.5">Options for this document</p>
+      </div>
+
+      <div class="p-3 space-y-1 text-xs">
+        <button onclick="sheetOpenDetail()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="book-open" class="w-4 h-4 text-brand-light"></i>
+          <span>Open & View Document Pages</span>
+        </button>
+
+        <button onclick="sheetExportPdf()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="file-down" class="w-4 h-4 text-brand"></i>
+          <span>Share / Download Searchable PDF</span>
+        </button>
+
+        <button onclick="sheetExportWord()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="file-type-2" class="w-4 h-4 text-blue-400"></i>
+          <span>Export to Microsoft Word (.docx)</span>
+        </button>
+
+        <button onclick="sheetExportZip()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="archive" class="w-4 h-4 text-purple-400"></i>
+          <span>Download High-Res Scans (ZIP)</span>
+        </button>
+
+        <button onclick="sheetWatermark()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="shield-alert" class="w-4 h-4 text-amber-400"></i>
+          <span>Anti-Theft Watermark</span>
+        </button>
+
+        <button onclick="sheetRenameDoc()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-slate-800/80 text-white font-medium transition text-left">
+          <i data-lucide="edit-3" class="w-4 h-4 text-slate-300"></i>
+          <span>Rename Document</span>
+        </button>
+
+        <button onclick="sheetDeleteDoc()" class="w-full flex items-center gap-3 px-3.5 py-3 rounded-xl hover:bg-red-500/10 text-red-400 font-medium transition text-left">
+          <i data-lucide="trash-2" class="w-4 h-4 text-red-400"></i>
+          <span>Delete Document</span>
+        </button>
+      </div>
+
+      <div class="p-3 border-t border-slate-800 bg-slate-900/40">
+        <button onclick="closeDocSheet()" class="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Frontend Logic -->
   <script>
     const state = {
@@ -1868,8 +1999,11 @@ HTML_CONTENT = """<!DOCTYPE html>
       contrast: 0,
       processedPageId: null,
 
-      // Interaction
-      activeHandle: null
+      // Interaction & Modals
+      activeHandle: null,
+      activePageViewerIndex: 0,
+      sheetDoc: null,
+      editingPageId: null
     };
 
     const views = {
@@ -2035,8 +2169,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     async function submitWatermark() {
       if (!state.activeDoc) return;
-      const textInput = document.getElementById('wm-text-input').value.trim() || 'CONFIDENTIAL';
-      const opacityVal = parseFloat(document.getElementById('wm-opacity-slider').value) / 100.0;
+      const textInput = (document.getElementById('wm-text-input') || document.getElementById('watermark-text-input'))?.value.trim() || 'CONFIDENTIAL';
+      const opacityEl = document.getElementById('wm-opacity-slider') || document.getElementById('watermark-opacity-slider');
+      const opacityVal = opacityEl ? parseFloat(opacityEl.value) / 100.0 : 0.25;
       const colorRadio = document.querySelector('input[name="wm-color"]:checked')?.value || 'gray';
 
       const btn = document.getElementById('btn-submit-watermark');
@@ -2084,55 +2219,46 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       function getPos(e) {
         const rect = sigCanvas.getBoundingClientRect();
-        const scaleX = sigCanvas.width / rect.width;
-        const scaleY = sigCanvas.height / rect.height;
-        let clientX = e.clientX;
-        let clientY = e.clientY;
-        if (e.touches && e.touches[0]) {
-          clientX = e.touches[0].clientX;
-          clientY = e.touches[0].clientY;
-        }
+        const scaleX = sigCanvas.width / Math.max(1, rect.width);
+        const scaleY = sigCanvas.height / Math.max(1, rect.height);
         return {
-          x: (clientX - rect.left) * scaleX,
-          y: (clientY - rect.top) * scaleY
+          x: (e.clientX - rect.left) * scaleX,
+          y: (e.clientY - rect.top) * scaleY
         };
       }
 
-      function startDraw(e) {
+      sigCanvas.addEventListener('pointerdown', (e) => {
         e.preventDefault();
+        try { sigCanvas.setPointerCapture(e.pointerId); } catch(err){}
         isDrawing = true;
         hasDrawn = true;
         const p = getPos(e);
         sigCtx.beginPath();
         sigCtx.moveTo(p.x, p.y);
-      }
+      });
 
-      function moveDraw(e) {
+      sigCanvas.addEventListener('pointermove', (e) => {
         if (!isDrawing) return;
         e.preventDefault();
         const p = getPos(e);
         sigCtx.strokeStyle = sigStrokeColor;
-        sigCtx.lineWidth = 3;
+        sigCtx.lineWidth = 3.5;
         sigCtx.lineCap = 'round';
         sigCtx.lineJoin = 'round';
         sigCtx.lineTo(p.x, p.y);
         sigCtx.stroke();
-      }
+      });
 
-      function endDraw(e) {
+      const stopDraw = (e) => {
         if (!isDrawing) return;
         e.preventDefault();
         isDrawing = false;
         sigCtx.closePath();
-      }
+        try { sigCanvas.releasePointerCapture(e.pointerId); } catch(err){}
+      };
 
-      sigCanvas.addEventListener('pointerdown', startDraw);
-      sigCanvas.addEventListener('pointermove', moveDraw);
-      sigCanvas.addEventListener('pointerup', endDraw);
-      sigCanvas.addEventListener('pointercancel', endDraw);
-      sigCanvas.addEventListener('touchstart', startDraw, { passive: false });
-      sigCanvas.addEventListener('touchmove', moveDraw, { passive: false });
-      sigCanvas.addEventListener('touchend', endDraw, { passive: false });
+      sigCanvas.addEventListener('pointerup', stopDraw);
+      sigCanvas.addEventListener('pointercancel', stopDraw);
     }
 
     function clearSignaturePad() {
@@ -2254,7 +2380,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       docs.forEach(doc => {
         const card = document.createElement('div');
         card.className = 'doc-card bg-brand-surface border border-slate-800 rounded-xl p-3 flex items-center gap-3.5 shadow-sm hover:border-slate-700 cursor-pointer transition';
-        const thumb = doc.pages?.[0]?.thumbnail_url || '';
+        const thumb = doc.pages?.[0]?.thumbnail_url ? `${doc.pages[0].thumbnail_url}?v=${doc.updated_at || Date.now()}` : '';
         const dateStr = new Date(doc.updated_at).toLocaleDateString(undefined, {
           month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
         });
@@ -2297,6 +2423,170 @@ HTML_CONTENT = """<!DOCTYPE html>
       return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    function downloadUrl(url, filename) {
+      const a = document.createElement('a');
+      a.href = url;
+      if (filename) a.download = filename;
+      a.target = '_blank';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 250);
+    }
+
+    // Document Bottom Sheet
+    function showDocMenu(doc) {
+      openDocSheet(doc);
+    }
+
+    function openDocSheet(doc) {
+      state.sheetDoc = doc;
+      document.getElementById('sheet-doc-title').textContent = doc.title || 'Document Options';
+      const count = doc.pages?.length || 1;
+      document.getElementById('sheet-doc-meta').textContent = `${count} ${count === 1 ? 'page' : 'pages'} • ${doc.category || 'General'} • ${new Date(doc.updated_at).toLocaleDateString()}`;
+      document.getElementById('modal-doc-sheet').classList.remove('hidden');
+      lucide.createIcons();
+    }
+
+    function closeDocSheet() {
+      document.getElementById('modal-doc-sheet').classList.add('hidden');
+      state.sheetDoc = null;
+    }
+
+    function sheetOpenDetail() {
+      if (!state.sheetDoc) return;
+      const d = state.sheetDoc;
+      closeDocSheet();
+      openDocumentDetail(d);
+    }
+
+    function sheetExportPdf() {
+      if (!state.sheetDoc) return;
+      downloadUrl(`/api/documents/${state.sheetDoc.id}/export-pdf?download=true`, `${state.sheetDoc.title}.pdf`);
+      closeDocSheet();
+    }
+
+    function sheetExportWord() {
+      if (!state.sheetDoc) return;
+      downloadUrl(`/api/documents/${state.sheetDoc.id}/export-docx`, `${state.sheetDoc.title}.docx`);
+      closeDocSheet();
+    }
+
+    function sheetExportZip() {
+      if (!state.sheetDoc) return;
+      downloadUrl(`/api/documents/${state.sheetDoc.id}/export-zip`, `${state.sheetDoc.title}_scans.zip`);
+      closeDocSheet();
+    }
+
+    function sheetWatermark() {
+      if (!state.sheetDoc) return;
+      state.activeDoc = state.sheetDoc;
+      closeDocSheet();
+      openWatermarkModal();
+    }
+
+    function sheetRenameDoc() {
+      if (!state.sheetDoc) return;
+      const doc = state.sheetDoc;
+      closeDocSheet();
+      const t = prompt('New title:', doc.title);
+      if (t && t.trim()) {
+        fetch(`/api/documents/${doc.id}`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ title: t.trim() })
+        }).then(() => fetchDocuments());
+      }
+    }
+
+    function sheetDeleteDoc() {
+      if (!state.sheetDoc) return;
+      const doc = state.sheetDoc;
+      closeDocSheet();
+      if (confirm(`Delete document "${doc.title}"?`)) {
+        fetch(`/api/documents/${doc.id}`, { method: 'DELETE' }).then(() => fetchDocuments());
+      }
+    }
+
+    // Full-Screen Page Viewer
+    function openPageViewer(idx) {
+      if (!state.activeDoc || !state.activeDoc.pages || !state.activeDoc.pages[idx]) return;
+      state.activePageViewerIndex = idx;
+      const p = state.activeDoc.pages[idx];
+      document.getElementById('pv-doc-title').textContent = state.activeDoc.title || 'Page View';
+      document.getElementById('pv-page-index').textContent = `Page ${idx + 1} of ${state.activeDoc.pages.length}`;
+      const imgEl = document.getElementById('pv-image');
+      imgEl.src = `${p.url}?v=${state.activeDoc.updated_at || Date.now()}`;
+      document.getElementById('modal-page-viewer').classList.remove('hidden');
+      lucide.createIcons();
+    }
+
+    function closePageViewer() {
+      document.getElementById('modal-page-viewer').classList.add('hidden');
+    }
+
+    function downloadActivePageImage() {
+      if (!state.activeDoc || !state.activeDoc.pages) return;
+      const p = state.activeDoc.pages[state.activePageViewerIndex];
+      if (!p) return;
+      downloadUrl(p.url, `${state.activeDoc.title}_page_${state.activePageViewerIndex + 1}.jpg`);
+    }
+
+    function pvExtractOcr() {
+      if (!state.activeDoc || !state.activeDoc.pages) return;
+      const p = state.activeDoc.pages[state.activePageViewerIndex];
+      if (p) runPageOcr(p.id);
+    }
+
+    async function pvEditEnhancement() {
+      if (!state.activeDoc || !state.activeDoc.pages) return;
+      const p = state.activeDoc.pages[state.activePageViewerIndex];
+      if (!p) return;
+      closePageViewer();
+
+      try {
+        const res = await fetch(`/api/pages/${p.id}/prepare-edit`, { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        state.uploadId = data.upload_id;
+        state.sourceWidth = data.width;
+        state.sourceHeight = data.height;
+        state.corners = data.corners;
+        state.editingPageId = p.id;
+        state.isAddingPage = false;
+
+        state.sourceImg.onload = () => {
+          setupCropWorkspace();
+        };
+        state.sourceImg.src = data.url + '?t=' + Date.now();
+      } catch (err) {
+        alert('Failed to edit page: ' + err.message);
+      }
+    }
+
+    function pvOpenSignature() {
+      if (!state.activeDoc || !state.activeDoc.pages) return;
+      const p = state.activeDoc.pages[state.activePageViewerIndex];
+      closePageViewer();
+      openSignatureModal();
+      if (p) {
+        const select = document.getElementById('sig-page-select');
+        if (select) select.value = p.id;
+      }
+    }
+
+    async function pvDeleteCurrentPage() {
+      if (!state.activeDoc || !state.activeDoc.pages) return;
+      const p = state.activeDoc.pages[state.activePageViewerIndex];
+      if (!p) return;
+      if (confirm(`Delete Page ${state.activePageViewerIndex + 1}?`)) {
+        closePageViewer();
+        await fetch(`/api/documents/${state.activeDoc.id}/pages/${p.id}`, { method: 'DELETE' });
+        const fresh = await (await fetch(`/api/documents/${state.activeDoc.id}`)).json();
+        openDocumentDetail(fresh);
+        fetchDocuments();
+      }
+    }
+
     function openDocumentDetail(doc) {
       state.activeDoc = doc;
       document.getElementById('doc-title-text').textContent = doc.title;
@@ -2309,9 +2599,15 @@ HTML_CONTENT = """<!DOCTYPE html>
       (doc.pages || []).forEach((p, idx) => {
         const item = document.createElement('div');
         item.className = 'bg-brand-surface rounded-xl border border-slate-800 overflow-hidden shadow-md flex flex-col';
+        const pageImgUrl = `${p.thumbnail_url || p.url}?v=${doc.updated_at || Date.now()}`;
         item.innerHTML = `
-          <div class="aspect-[3/4] bg-slate-900 overflow-hidden flex items-center justify-center p-1.5 cursor-pointer">
-            <img src="${p.thumbnail_url || p.url}" class="w-full h-full object-contain rounded">
+          <div class="aspect-[3/4] bg-slate-900 overflow-hidden flex items-center justify-center p-1.5 cursor-pointer relative group" onclick="openPageViewer(${idx})">
+            <img src="${pageImgUrl}" class="w-full h-full object-contain rounded">
+            <div class="absolute inset-0 bg-brand/10 opacity-0 group-hover:opacity-100 flex items-center justify-center transition">
+              <span class="px-2 py-1 rounded bg-black/80 text-white text-[10px] font-semibold flex items-center gap-1 shadow">
+                <i data-lucide="maximize-2" class="w-3 h-3 text-brand"></i> Zoom
+              </span>
+            </div>
           </div>
           <div class="px-3 py-2 flex items-center justify-between border-t border-slate-800/80 bg-slate-900/40 text-xs">
             <span class="font-medium text-slate-300">Page ${idx + 1}</span>
@@ -2377,26 +2673,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       navigator.clipboard.writeText(text);
       alert('OCR text copied to clipboard!');
     });
-
-    function showDocMenu(doc) {
-      const choice = prompt(`Document: "${doc.title}"\\n1. Export / Share PDF\\n2. Rename Document\\n3. Delete Document\\nType 1, 2, or 3:`, '1');
-      if (choice === '1') {
-        window.open(`/api/documents/${doc.id}/export-pdf`, '_blank');
-      } else if (choice === '2') {
-        const newTitle = prompt('New title:', doc.title);
-        if (newTitle && newTitle.trim()) {
-          fetch(`/api/documents/${doc.id}`, {
-            method: 'PUT',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ title: newTitle.trim() })
-          }).then(() => fetchDocuments());
-        }
-      } else if (choice === '3') {
-        if (confirm(`Delete "${doc.title}"?`)) {
-          fetch(`/api/documents/${doc.id}`, { method: 'DELETE' }).then(() => fetchDocuments());
-        }
-      }
-    }
 
     // Upload & Scan Handling
     async function handleFileSelect(file) {
@@ -2554,7 +2830,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     function findHandle(pos) {
       const s = state.displayScale;
-      const hit = 28;
+      const hit = 44;
       const corners = {
         tl: { x: state.corners.tl.x * s, y: state.corners.tl.y * s },
         tr: { x: state.corners.tr.x * s, y: state.corners.tr.y * s },
@@ -2585,6 +2861,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       const h = findHandle(pos);
       if (!h) return;
       state.activeHandle = h;
+      try { cropCanvas.setPointerCapture(e.pointerId); } catch(err){}
       updateLoupe(pos);
       loupe.classList.remove('hidden');
     });
@@ -2617,9 +2894,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       updateLoupe(pos);
     });
 
-    window.addEventListener('pointerup', () => {
+    window.addEventListener('pointerup', (e) => {
       state.activeHandle = null;
       loupe.classList.add('hidden');
+      try { if (e.pointerId) cropCanvas.releasePointerCapture(e.pointerId); } catch(err){}
     });
 
     function updateLoupe(pos) {
@@ -2627,8 +2905,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       const rx = pos.x / s;
       const ry = pos.y / s;
 
-      loupe.style.left = `${pos.screenX}px`;
-      loupe.style.top = `${pos.screenY - 30}px`;
+      const lx = Math.max(12, Math.min(window.innerWidth - 124, pos.screenX - 56));
+      const ly = Math.max(12, pos.screenY - 110);
+      loupe.style.left = `${lx}px`;
+      loupe.style.top = `${ly}px`;
 
       loupeCanvas.width = 112;
       loupeCanvas.height = 112;
@@ -2638,6 +2918,46 @@ HTML_CONTENT = """<!DOCTYPE html>
         rx - 25, ry - 25, 50, 50,
         0, 0, 112, 112
       );
+      loupeCtx.strokeStyle = '#00b796';
+      loupeCtx.lineWidth = 1.5;
+      loupeCtx.beginPath();
+      loupeCtx.moveTo(56, 42); loupeCtx.lineTo(56, 70);
+      loupeCtx.moveTo(42, 56); loupeCtx.lineTo(70, 56);
+      loupeCtx.stroke();
+    }
+
+    function rotateSourceImage(clockwise = true) {
+      if (!state.sourceImg || !state.sourceWidth) return;
+      const oc = document.createElement('canvas');
+      oc.width = state.sourceHeight;
+      oc.height = state.sourceWidth;
+      const octx = oc.getContext('2d');
+      octx.translate(oc.width / 2, oc.height / 2);
+      octx.rotate(clockwise ? Math.PI / 2 : -Math.PI / 2);
+      octx.drawImage(state.sourceImg, -state.sourceWidth / 2, -state.sourceHeight / 2);
+
+      const oldW = state.sourceWidth;
+      const oldH = state.sourceHeight;
+      const oldC = { ...state.corners };
+
+      function rotPt(p) {
+        return clockwise
+          ? { x: Math.round(oldH - p.y), y: Math.round(p.x) }
+          : { x: Math.round(p.y), y: Math.round(oldW - p.x) };
+      }
+
+      state.corners = clockwise
+        ? { tl: rotPt(oldC.bl), tr: rotPt(oldC.tl), br: rotPt(oldC.tr), bl: rotPt(oldC.br) }
+        : { tl: rotPt(oldC.tr), tr: rotPt(oldC.br), br: rotPt(oldC.bl), bl: rotPt(oldC.tl) };
+
+      state.sourceWidth = oc.width;
+      state.sourceHeight = oc.height;
+
+      state.sourceImg.onload = () => {
+        updateCropDisplaySize();
+        drawCropCanvas();
+      };
+      state.sourceImg.src = oc.toDataURL('image/jpeg', 0.94);
     }
 
     // Process & Filter Warp
@@ -2655,7 +2975,8 @@ HTML_CONTENT = """<!DOCTYPE html>
             corners: state.corners,
             filter_type: state.filterType,
             brightness: state.brightness,
-            contrast: state.contrast
+            contrast: state.contrast,
+            target_page_id: state.editingPageId || null
           })
         });
 
@@ -2674,7 +2995,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     async function saveCurrentScan() {
       if (!state.processedPageId) return;
 
-      if (state.isAddingPage && state.activeDoc) {
+      if (state.editingPageId && state.activeDoc) {
+        state.editingPageId = null;
+        const fresh = await (await fetch(`/api/documents/${state.activeDoc.id}`)).json();
+        await fetchDocuments();
+        openDocumentDetail(fresh);
+      } else if (state.isAddingPage && state.activeDoc) {
         const form = new FormData();
         form.append('page_id', state.processedPageId);
         const res = await fetch(`/api/documents/${state.activeDoc.id}/pages`, {
@@ -2719,7 +3045,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     };
 
     document.getElementById('btn-crop-cancel').onclick = () => {
-      switchView(state.isAddingPage && state.activeDoc ? 'doc' : 'home');
+      state.editingPageId = null;
+      switchView(state.activeDoc ? 'doc' : 'home');
     };
 
     document.getElementById('btn-crop-all').onclick = () => {
@@ -2730,6 +3057,30 @@ HTML_CONTENT = """<!DOCTYPE html>
         bl: {x: 0, y: state.sourceHeight}
       };
       drawCropCanvas();
+    };
+
+    document.getElementById('btn-rotate-right').onclick = () => rotateSourceImage(true);
+    document.getElementById('btn-rotate-left').onclick = () => rotateSourceImage(false);
+
+    document.getElementById('btn-crop-auto').onclick = async () => {
+      if (!state.uploadId) return;
+      const btn = document.getElementById('btn-crop-auto');
+      const origHtml = btn.innerHTML;
+      btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin text-brand"></i><span>Snapping...</span>';
+      lucide.createIcons();
+      try {
+        const res = await fetch(`/api/scan/redetect-corners/${state.uploadId}`, { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          state.corners = data.corners;
+          drawCropCanvas();
+        }
+      } catch (err) {
+        console.error('Auto snap failed', err);
+      } finally {
+        btn.innerHTML = origHtml;
+        lucide.createIcons();
+      }
     };
 
     document.getElementById('btn-crop-next').onclick = async () => {
@@ -2779,30 +3130,31 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     document.getElementById('btn-add-page').onclick = () => {
       state.isAddingPage = true;
+      state.editingPageId = null;
       document.getElementById('camera-file-input').click();
     };
 
     document.getElementById('btn-export-pdf').onclick = () => {
       if (state.activeDoc) {
-        window.open(`/api/documents/${state.activeDoc.id}/export-pdf?download=true`, '_blank');
+        downloadUrl(`/api/documents/${state.activeDoc.id}/export-pdf?download=true`, `${state.activeDoc.title}.pdf`);
       }
     };
 
     document.getElementById('btn-export-txt').onclick = () => {
       if (state.activeDoc) {
-        window.open(`/api/documents/${state.activeDoc.id}/export-txt`, '_blank');
+        downloadUrl(`/api/documents/${state.activeDoc.id}/export-txt`, `${state.activeDoc.title}_ocr.txt`);
       }
     };
 
     document.getElementById('btn-export-docx').onclick = () => {
       if (state.activeDoc) {
-        window.open(`/api/documents/${state.activeDoc.id}/export-docx`, '_blank');
+        downloadUrl(`/api/documents/${state.activeDoc.id}/export-docx`, `${state.activeDoc.title}.docx`);
       }
     };
 
     document.getElementById('btn-export-zip').onclick = () => {
       if (state.activeDoc) {
-        window.open(`/api/documents/${state.activeDoc.id}/export-zip`, '_blank');
+        downloadUrl(`/api/documents/${state.activeDoc.id}/export-zip`, `${state.activeDoc.title}_scans.zip`);
       }
     };
 

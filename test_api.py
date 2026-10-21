@@ -39,6 +39,42 @@ def create_synthetic_document_image() -> bytes:
     return buf.getvalue()
 
 
+@pytest.fixture(scope="module")
+def upload_data():
+    img_bytes = create_synthetic_document_image()
+    response = client.post(
+        "/api/scan/upload",
+        files={"file": ("test_doc.jpg", img_bytes, "image/jpeg")}
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    return data["upload_id"], data["corners"]
+
+
+@pytest.fixture(scope="module")
+def upload_id(upload_data):
+    return upload_data[0]
+
+
+@pytest.fixture(scope="module")
+def corners(upload_data):
+    return upload_data[1]
+
+
+@pytest.fixture(scope="function")
+def page_id(upload_id, corners):
+    payload = {
+        "upload_id": upload_id,
+        "corners": corners,
+        "filter_type": "magic",
+        "brightness": 0,
+        "contrast": 0
+    }
+    response = client.post("/api/scan/warp-filter", json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()["page_id"]
+
+
 def test_upload_and_detect_corners():
     img_bytes = create_synthetic_document_image()
     response = client.post(
@@ -244,6 +280,25 @@ def test_id_card_from_files():
     client.delete(f"/api/documents/{doc['id']}")
 
 
+def test_redetect_corners(upload_id: str):
+    res = client.post(f"/api/scan/redetect-corners/{upload_id}")
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert "corners" in data
+    assert "tl" in data["corners"]
+    print("\n[OK] Auto Re-detect Corners passed:", data["corners"])
+
+
+def test_prepare_page_edit(page_id: str):
+    res = client.post(f"/api/pages/{page_id}/prepare-edit")
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert "upload_id" in data
+    assert "corners" in data
+    assert data["page_id"] == page_id
+    print("\n[OK] Page Prepare-Edit passed for:", page_id)
+
+
 def test_batch_upload():
     img_bytes = create_synthetic_document_image()
     res = client.post(
@@ -272,6 +327,8 @@ if __name__ == "__main__":
     test_id_card_composite(page_id)
     test_id_card_from_files()
     test_batch_upload()
+    test_redetect_corners(upload_id)
+    test_prepare_page_edit(page_id)
     test_document_lifecycle_and_dual_layer_pdf(page_id)
     print("\n=======================================================")
     print("  ALL EXTENDED CAMSCANNER PRO TESTS PASSED 100%!")
