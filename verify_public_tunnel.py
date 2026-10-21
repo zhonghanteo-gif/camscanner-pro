@@ -4,7 +4,7 @@ import cv2
 import io
 import json
 
-BASE_URL = "https://address-metal-kits-springer.trycloudflare.com"
+BASE_URL = "https://dramatic-ivory-filter-whale.trycloudflare.com"
 
 print(f"Testing public HTTPS URL: {BASE_URL}")
 
