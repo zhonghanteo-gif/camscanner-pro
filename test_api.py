@@ -158,6 +158,48 @@ def test_document_lifecycle_and_dual_layer_pdf(page_id):
     assert len(txt_res.text) > 20
     print("\n[OK] Plain Text OCR Export passed! Content length:", len(txt_res.text))
 
+    # 5b. Export DOCX (Microsoft Word)
+    docx_res = client.get(f"/api/documents/{doc_id}/export-docx")
+    assert docx_res.status_code == 200
+    assert len(docx_res.content) > 1000
+    print("\n[OK] Microsoft Word DOCX Export passed! Size:", len(docx_res.content), "bytes")
+
+    # 5c. Export ZIP (High-res scan archive)
+    zip_res = client.get(f"/api/documents/{doc_id}/export-zip")
+    assert zip_res.status_code == 200
+    assert len(zip_res.content) > 1000
+    print("\n[OK] High-Res Scans ZIP Export passed! Size:", len(zip_res.content), "bytes")
+
+    # 5d. Test Anti-Theft Watermark
+    wm_res = client.post(f"/api/documents/{doc_id}/watermark", json={
+        "watermark_text": "FOR VERIFICATION ONLY",
+        "opacity": 0.3,
+        "color": "green"
+    })
+    assert wm_res.status_code == 200, wm_res.text
+    print("\n[OK] Anti-Theft Watermark generation passed!")
+
+    # 5e. Test Electronic Signature Stamping
+    # Create simple dummy 100x40 signature image in base64
+    sig_img = Image.new("RGBA", (120, 50), (0, 0, 0, 0))
+    d = ImageDraw.Draw(sig_img)
+    d.line([(10, 40), (40, 10), (70, 35), (110, 15)], fill=(0, 50, 180, 255), width=3)
+    sig_buf = io.BytesIO()
+    sig_img.save(sig_buf, format="PNG")
+    sig_b64 = "data:image/png;base64," + io.BytesIO(sig_buf.getvalue()).getvalue().hex()
+    import base64
+    sig_b64_real = "data:image/png;base64," + base64.b64encode(sig_buf.getvalue()).decode("utf-8")
+
+    sig_res = client.post(f"/api/documents/{doc_id}/signature", json={
+        "page_id": page_id,
+        "signature_data": sig_b64_real,
+        "pos_x_pct": 0.60,
+        "pos_y_pct": 0.75,
+        "scale_pct": 0.25
+    })
+    assert sig_res.status_code == 200, sig_res.text
+    print("\n[OK] Electronic Signature Stamping passed!")
+
     # 6. Clean up test document
     del_res = client.delete(f"/api/documents/{doc_id}")
     assert del_res.status_code == 200
@@ -202,6 +244,25 @@ def test_id_card_from_files():
     client.delete(f"/api/documents/{doc['id']}")
 
 
+def test_batch_upload():
+    img_bytes = create_synthetic_document_image()
+    res = client.post(
+        "/api/scan/batch-upload",
+        files=[
+            ("files", ("batch_page1.jpg", img_bytes, "image/jpeg")),
+            ("files", ("batch_page2.jpg", img_bytes, "image/jpeg"))
+        ],
+        data={"title": "Multi-Page Batch Scan Test", "category": "Invoice"}
+    )
+    assert res.status_code == 200, res.text
+    doc = res.json()
+    assert len(doc["pages"]) == 2
+    print("\n[OK] Multi-Page Batch Scan passed! Doc ID:", doc["id"], "Pages:", len(doc["pages"]))
+
+    # Clean up
+    client.delete(f"/api/documents/{doc['id']}")
+
+
 if __name__ == "__main__":
     print("Running CamScanner Pro Extended Pipeline Test Suite...")
     upload_id, corners = test_upload_and_detect_corners()
@@ -210,6 +271,7 @@ if __name__ == "__main__":
     test_ocr_extraction(page_id)
     test_id_card_composite(page_id)
     test_id_card_from_files()
+    test_batch_upload()
     test_document_lifecycle_and_dual_layer_pdf(page_id)
     print("\n=======================================================")
     print("  ALL EXTENDED CAMSCANNER PRO TESTS PASSED 100%!")
